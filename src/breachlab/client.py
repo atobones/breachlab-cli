@@ -244,6 +244,23 @@ class Client:
         return items, True
 
 
+def endpoint_missing(error):
+    """True when the server has no such endpoint or method.
+
+    Newer endpoints answer 404 or 405 on a server that does not have them
+    yet. The caller then falls back to the older way of getting the same
+    answer, so one client works against both.
+    """
+    return isinstance(error, ApiError) and error.status in (404, 405)
+
+
+def doc_link(value):
+    """Return a documentation link from the API when it is a plain https URL."""
+    if isinstance(value, str) and value.startswith("https://") and len(value) <= 300:
+        return value
+    return None
+
+
 def error_from(status, headers, payload):
     """Build an ApiError from any non-success answer."""
     retry_after = _retry_after(headers, payload)
@@ -251,9 +268,7 @@ def error_from(status, headers, payload):
         detail = payload.get("detail")
         if not isinstance(detail, str) or not detail:
             detail = payload.get("title") if isinstance(payload.get("title"), str) else "Request failed."
-        doc_url = payload.get("doc_url")
-        if not (isinstance(doc_url, str) and doc_url.startswith("https://")):
-            doc_url = None
+        doc_url = doc_link(payload.get("doc_url"))
         request_id = payload.get("request_id")
         if not isinstance(request_id, str):
             request_id = headers.get("Request-Id")

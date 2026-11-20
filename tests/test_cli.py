@@ -83,6 +83,14 @@ class CliCase(unittest.TestCase):
     def paths(self, method=None):
         return [r["path"] for r in self.state.requests if method in (None, r["method"])]
 
+    def calls(self):
+        return [(r["method"], r["path"]) for r in self.state.requests]
+
+    def old_server(self, missing_status=404):
+        """Make the stub the API as it was before the newer endpoints."""
+        self.state.new_endpoints = False
+        self.state.missing_status = missing_status
+
 
 class LoginTests(CliCase):
     def test_device_flow_stores_the_token(self):
@@ -160,16 +168,255 @@ class LoginTests(CliCase):
         self.assertNotIn(TOKEN, result.out + result.err)
         self.assertNotIn(DEVICE_CODE, result.out + result.err)
 
-    def test_logout(self):
+    def test_scope_option_passes_the_scopes_through(self):
+        self.state.allowed_scopes = ["read", "submit", "play"]
+        result = self.run_cli("login", "--scope", "read,submit", "play")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(json.loads(self.state.requests[0]["body"]), {"scope": "read submit play"})
+        self.assertIn("Granted scopes: read, submit, play.", result.out)
+        self.assertNotIn("cannot submit", result.out)
+
+    def test_scope_option_is_not_checked_against_a_list(self):
+        self.state.allowed_scopes = ["read", "labs:beta_2"]
+        result = self.run_cli("login", "--json", "--scope", "labs:beta_2 read read")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(json.loads(self.state.requests[0]["body"]), {"scope": "labs:beta_2 read"})
+        self.assertEqual(result.json()["scope"], "read labs:beta_2")
+
+    def test_scope_without_submit_says_so(self):
+        self.state.allowed_scopes = ["read", "submit", "play"]
+        result = self.run_cli("login", "--scope", "read,play")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("Granted scopes: read, play.", result.out)
+        self.assertIn("cannot submit", result.out)
+
+    def test_scope_the_server_does_not_grant(self):
+        result = self.run_cli("login", "--scope", "read,play")
+        self.assertEqual(result.code, 1)
+        self.assertEqual(result.out, "")
+        self.assertIn("The server refused the requested scope. Allowed scopes: read, submit.",
+                      result.err)
+        self.assertIn("Code: invalid_scope.", result.err)
+        self.assertIn("Docs: https://breachlab.org/docs/api/errors/invalid_scope", result.err)
+        self.assertEqual(len(result.err.strip().splitlines()), 1)
+        self.assertFalse(os.path.exists(self.token_file))
+        self.assertEqual(self.paths(), ["/api/v1/auth/device"])
+
+    def test_scope_refused_by_an_old_server_has_no_doc_link(self):
+        self.old_server()
+        result = self.run_cli("login", "--json", "--scope", "play")
+        self.assertEqual(result.code, 1)
+        self.assertIn("Code: invalid_scope.", result.err)
+        self.assertNotIn("Docs:", result.err)
+        self.assertNotIn("doc_url", result.json()["error"])
+
+    def test_scope_usage_errors_send_nothing(self):
+        for argv in (["login", "--scope", "read;rm"], ["login", "--scope", "re\x1bad"],
+                     ["login", "--scope", ","], ["login", "--scope", "x" * 33],
+                     ["login", "--scope"], ["login", "--read-only", "--scope", "read"]):
+            result = self.run_cli(*argv)
+            self.assertEqual(result.code, 2, argv)
+            self.assertNotIn("\x1b", result.err)
+        self.assertEqual(self.state.requests, [])
+
+    def test_denied_shows_the_servers_reason_and_doc_link(self):
+        self.state.poll_script = ["access_denied"]
+        result = self.run_cli("login")
+        self.assertEqual(result.code, 3)
+        self.assertIn("maximum number of active tokens. Nothing was saved.", result.err)
+        self.assertIn("Docs: https://breachlab.org/docs/api/errors/access_denied", result.err)
+        self.assertEqual(len(result.err.strip().splitlines()), 1)
+        as_json = self.run_cli("login", "--json")
+        self.assertEqual(as_json.json()["error"]["doc_url"],
+                         "https://breachlab.org/docs/api/errors/expired_token")
+
+    def test_poll_errors_from_an_old_server(self):
+        self.old_server()
+        self.state.poll_script = ["access_denied"]
+        denied = self.run_cli("login")
+        self.assertEqual(denied.code, 3)
+        self.assertIn("denied in the browser. Nothing was saved.", denied.err)
+        self.assertNotIn("Docs:", denied.err)
+        self.state.poll_script = ["expired_token"]
+        expired = self.run_cli("login")
+        self.assertEqual(expired.code, 3)
+        self.assertNotIn("Docs:", expired.err)
+
+    def test_expired_code_shows_the_doc_link(self):
+        self.state.poll_script = ["expired_token"]
+        result = self.run_cli("login")
+        self.assertEqual(result.code, 3)
+        self.assertIn("Docs: https://breachlab.org/docs/api/errors/expired_token", result.err)
+
+    def test_unknown_poll_error_is_reported_with_its_description(self):
+        self.state.poll_script = ["server_busy"]
+        result = self.run_cli("login", "--json")
+        self.assertEqual(result.code, 1)
+        self.assertIn("The server refused the login. The request failed.", result.err)
+        self.assertEqual(result.json()["error"]["code"], "server_busy")
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_doc_link_that_is_not_https_is_not_printed(self):
+        self.state.device_doc_base = "http://evil.example/\x1b[31m"
+        self.state.poll_script = ["access_denied"]
+        denied = self.run_cli("login")
+        self.assertEqual(denied.code, 3)
+        self.assertNotIn("Docs:", denied.err)
+        self.assertNotIn("evil.example", denied.err)
+        refused = self.run_cli("login", "--scope", "nope")
+        self.assertEqual(refused.code, 1)
+        self.assertNotIn("evil.example", refused.err)
+        self.assertNotIn("\x1b", denied.err + refused.err)
+
+
+class LogoutTests(CliCase):
+    BY_HAND = "Revoke it by hand at https://breachlab.org/dashboard/account"
+
+    def test_revokes_on_the_server_then_removes_the_file(self):
         self.login()
         result = self.run_cli("logout")
-        self.assertEqual(result.code, 0)
-        self.assertIn("Logged out.", result.out)
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("Logged out. The token was revoked on the server and removed from", result.out)
+        self.assertEqual(result.err, "")
         self.assertFalse(os.path.exists(self.token_file))
+        self.assertEqual(self.calls(), [("DELETE", "/api/v2/token")])
+        request = self.state.requests[0]
+        self.assertEqual(request["headers"]["authorization"], "Bearer " + TOKEN)
+        self.assertEqual(request["body"], b"")
+        self.assertEqual(request["query"], {})
+        self.assertNotIn(TOKEN, result.out + result.err)
+        # The token is dead on the server, not only forgotten here.
+        after = self.run_cli("whoami", env=self.env(BREACHLAB_TOKEN=TOKEN))
+        self.assertEqual(after.code, 3)
+
+    def test_second_logout_sends_nothing(self):
+        self.login()
+        self.run_cli("logout")
         again = self.run_cli("logout")
         self.assertEqual(again.code, 0)
         self.assertIn("not logged in", again.out)
+        self.assertEqual(len(self.state.requests), 1)
+
+    def test_old_server_still_removes_the_file_and_says_how_to_revoke(self):
+        for missing_status in (404, 405):
+            self.login()
+            self.old_server(missing_status)
+            result = self.run_cli("logout")
+            self.assertEqual(result.code, 0, result.err)
+            self.assertIn("Logged out. The token was removed from", result.out)
+            self.assertNotIn("revoked", result.out)
+            self.assertIn("This server cannot revoke tokens yet, so the token may still be valid. "
+                          + self.BY_HAND, result.err)
+            self.assertFalse(os.path.exists(self.token_file))
+        self.assertEqual(self.calls(), [("DELETE", "/api/v2/token")] * 2)
+        self.assertFalse(self.state.revoked)
+
+    def test_unreachable_server_still_removes_the_file(self):
+        self.login()
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        result = self.run_cli("logout", env=self.env(BREACHLAB_API="http://127.0.0.1:%d" % port))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("Logged out. The token was removed from", result.out)
+        self.assertIn("The server could not be reached, so the token may still be valid. "
+                      + self.BY_HAND, result.err)
+        self.assertNotIn("Traceback", result.err)
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_token_the_server_no_longer_knows_counts_as_revoked(self):
+        self.login("blp_" + "x" * 43)
+        result = self.run_cli("logout")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("had already revoked the token or let it expire", result.out)
+        self.assertEqual(result.err, "")
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_server_error_is_not_waited_out_and_the_file_still_goes(self):
+        self.login()
+        self.state.rate_limit_next = 5
+        result = self.run_cli("logout")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(result.sleeps, [])
+        self.assertEqual(len(self.state.requests), 1)
+        self.assertIn("The server did not revoke the token, so the token may still be valid. "
+                      + self.BY_HAND, result.err)
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_redirect_is_not_followed(self):
+        self.login()
+        self.state.redirect_next = self.server.url + "/api/v2/token?hop=1"
+        result = self.run_cli("logout")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(len(self.state.requests), 1)
+        self.assertIn("may still be valid", result.err)
+        self.assertFalse(self.state.revoked)
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_refused_base_url_sends_nothing_and_the_file_still_goes(self):
+        self.login()
+        result = self.run_cli("logout", env=self.env(BREACHLAB_API="http://example.com"))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("may still be valid", result.err)
         self.assertEqual(self.state.requests, [])
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_saved_token_is_revoked_and_the_environment_token_is_left_alone(self):
+        self.login()
+        other = "blp_" + "y" * 43
+        result = self.run_cli("logout", env=self.env(BREACHLAB_TOKEN=other))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(self.state.requests[0]["headers"]["authorization"], "Bearer " + TOKEN)
+        self.assertEqual(len(self.state.requests), 1)
+        self.assertIn("BREACHLAB_TOKEN is still set", result.err)
+        self.assertNotIn(other, result.out + result.err)
+
+    def test_environment_token_alone_is_never_revoked(self):
+        result = self.run_cli("logout", env=self.env(BREACHLAB_TOKEN=TOKEN))
+        self.assertEqual(result.code, 0)
+        self.assertIn("not logged in", result.out)
+        self.assertIn("Logout does not revoke it", result.err)
+        self.assertEqual(self.state.requests, [])
+        self.assertFalse(self.state.revoked)
+
+    def test_damaged_token_file_is_removed_without_a_request(self):
+        os.makedirs(os.path.dirname(self.token_file))
+        with open(self.token_file, "w") as handle:
+            handle.write("not a token\n")
+        result = self.run_cli("logout")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("damaged token file", result.out)
+        self.assertIn("nothing was revoked", result.err)
+        self.assertNotIn("not a token", result.out + result.err)
+        self.assertEqual(self.state.requests, [])
+        self.assertFalse(os.path.exists(self.token_file))
+
+    def test_json(self):
+        self.login()
+        data = self.run_cli("logout", "--json").json()
+        self.assertEqual(data, {"logged_out": True, "revoked": True, "revocation": "revoked",
+                                "token_path": self.token_file})
+        self.assertEqual(self.run_cli("--json", "logout").json(),
+                         {"logged_out": False, "revoked": False, "token_path": self.token_file})
+
+    def test_json_on_an_old_server(self):
+        self.login()
+        self.old_server()
+        result = self.run_cli("logout", "--json")
+        self.assertEqual(result.json(), {
+            "logged_out": True, "revoked": False, "revocation": "unsupported",
+            "token_path": self.token_file,
+            "revoke_url": "https://breachlab.org/dashboard/account"})
+        self.assertIn("may still be valid", result.err)
+
+    def test_debug_redacts_the_token(self):
+        self.login()
+        result = self.run_cli("--debug", "logout")
+        self.assertEqual(result.code, 0)
+        self.assertIn("debug: > DELETE", result.err)
+        self.assertIn("Authorization: Bearer ***", result.err)
+        self.assertNotIn(TOKEN, result.out + result.err)
 
 
 class AuthTests(CliCase):
@@ -269,7 +516,70 @@ class ReadTests(CliCase):
         self.assertRegex(result.out, r"User\s+operator_01")
         self.assertRegex(result.out, r"Points\s+1200")
         self.assertRegex(result.out, r"Subscription\s+inactive")
-        self.assertEqual(self.run_cli("whoami", "--json").json(), self.state.account)
+        self.assertRegex(result.out, r"Rank\s+42 on the humans board")
+        self.assertRegex(result.out, r"Scopes\s+read, submit")
+        self.assertRegex(result.out, r"Expires\s+never")
+        self.assertNotIn("cannot submit", result.out)
+        self.assertEqual(self.calls(), [("GET", "/api/v2/me"), ("GET", "/api/v2/token")])
+
+    def test_whoami_json_carries_the_token_object(self):
+        data = self.run_cli("whoami", "--json").json()
+        token = data.pop("token")
+        self.assertEqual(data, self.state.account)
+        self.assertEqual(token, {"object": "token", "scopes": ["read", "submit"],
+                                 "created_at": "2026-11-19T20:40:12.000Z", "expires_at": None,
+                                 "is_agent": False})
+
+    def test_whoami_says_when_the_token_cannot_submit(self):
+        self.state.scopes = ["read", "play"]
+        self.state.token_expires_at = "2027-02-17T20:40:12.000Z"
+        result = self.run_cli("whoami")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertRegex(result.out, r"Scopes\s+read, play")
+        self.assertRegex(result.out, r"Expires\s+2027-02-17 20:40 UTC")
+        self.assertEqual(result.out.splitlines()[-1],
+                         'This token cannot submit flags. Run "breachlab login" to get one that can.')
+
+    def test_whoami_unranked_and_agent_board(self):
+        self.state.account["leaderboard"] = None
+        self.assertNotIn("Rank", self.run_cli("whoami").out)
+        self.state.account["leaderboard"] = {"board": "agents", "rank": 3, "points": 900}
+        self.assertRegex(self.run_cli("whoami").out, r"Rank\s+3 on the agents board")
+        self.assertIn("rank 3 on the agents board", self.run_cli("status").out.splitlines()[0])
+        for odd in ({"board": "humans", "rank": "1\x1b[2J"}, {"board": "humans", "rank": True},
+                    {"board": "humans", "rank": 0}, "first", ["humans", 1]):
+            self.state.account["leaderboard"] = odd
+            result = self.run_cli("whoami")
+            self.assertEqual(result.code, 0, result.err)
+            self.assertNotIn("Rank", result.out)
+        self.state.account["leaderboard"] = {"board": "te\x1bams", "rank": 9}
+        self.assertRegex(self.run_cli("whoami").out, r"Rank\s+9\n")
+
+    def test_whoami_on_an_old_server(self):
+        for missing_status in (404, 405):
+            self.old_server(missing_status)
+            result = self.run_cli("whoami")
+            self.assertEqual(result.code, 0, result.err)
+            self.assertEqual(result.err, "")
+            self.assertRegex(result.out, r"User\s+operator_01")
+            for absent in ("Scopes", "Expires", "Rank", "cannot submit"):
+                self.assertNotIn(absent, result.out)
+            data = self.run_cli("whoami", "--json").json()
+            self.assertIsNone(data["token"])
+            self.assertNotIn("leaderboard", data)
+
+    def test_whoami_token_scopes_are_neutralised(self):
+        self.state.scopes = ["read", "sub\x1b[31mmit"]
+        result = self.run_cli("whoami")
+        self.assertNotIn("\x1b", result.out)
+        self.assertIn("read, sub?[31mmit", result.out)
+
+    def test_whoami_does_not_hide_other_token_errors(self):
+        self.state.token_failure = 500
+        result = self.run_cli("whoami")
+        self.assertEqual(result.code, 1)
+        self.assertEqual(result.out, "")
+        self.assertIn("Code: internal_error.", result.err)
 
     def test_tracks(self):
         result = self.run_cli("tracks")
@@ -308,10 +618,65 @@ class ReadTests(CliCase):
         self.assertEqual(result.code, 0, result.err)
         self.assertIn("ghost level 2: Ghost Level 2", result.out)
         self.assertIn("Briefing for ghost level 2.", result.out)
+        # One request, to the level itself. The list is not paged.
+        self.assertEqual(self.calls(), [("GET", "/api/v2/tracks/ghost/levels/2")])
+        self.assertEqual(self.state.requests[0]["query"], {})
         locked = self.run_cli("levels", "phantom", "0")
         self.assertIn("briefing is hidden", locked.out)
+        self.assertEqual(self.run_cli("levels", "ghost", "2", "--json").json(),
+                         self.state.levels["ghost"][2])
+
+    def test_one_level_that_does_not_exist(self):
         missing = self.run_cli("levels", "ghost", "99")
         self.assertEqual(missing.code, 1)
+        self.assertIn('Track "ghost" has no level 99.', missing.err)
+        self.assertEqual(self.paths(), ["/api/v2/tracks/ghost/levels/99",
+                                        "/api/v2/tracks/ghost/levels"])
+        unknown = self.run_cli("levels", "nope", "0")
+        self.assertEqual(unknown.code, 1)
+        self.assertIn('no live track named "nope"', unknown.err)
+        self.assertIn("Code: not_found.", unknown.err)
+
+    def test_one_level_on_an_old_server_pages_the_list(self):
+        new = self.run_cli("levels", "ghost", "2")
+        as_json = self.run_cli("levels", "ghost", "2", "--json").json()
+        for missing_status in (404, 405):
+            self.state.requests[:] = []
+            self.old_server(missing_status)
+            old = self.run_cli("levels", "ghost", "2")
+            self.assertEqual(old.code, 0, old.err)
+            self.assertEqual(old.out, new.out)
+            self.assertEqual(old.err, "")
+            self.assertEqual(self.paths(), ["/api/v2/tracks/ghost/levels/2",
+                                            "/api/v2/tracks/ghost/levels"])
+            self.assertEqual(self.run_cli("levels", "ghost", "2", "--json").json(), as_json)
+            self.assertIn("briefing is hidden", self.run_cli("levels", "phantom", "0").out)
+            missing = self.run_cli("levels", "ghost", "99")
+            self.assertEqual(missing.code, 1)
+            self.assertIn('Track "ghost" has no level 99.', missing.err)
+            self.assertIn('no live track named "nope"', self.run_cli("levels", "nope", "0").err)
+
+    def test_one_level_deep_in_a_long_track_on_an_old_server(self):
+        self.state.levels["ghost"] = stub_server.make_levels("ghost", 230, 7)
+        self.old_server()
+        result = self.run_cli("levels", "ghost", "215")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("ghost level 215: Ghost Level 215", result.out)
+        self.assertEqual(len(self.state.requests), 4)
+
+    def test_one_level_other_errors_do_not_fall_back(self):
+        self.state.rate_limit_next = 1
+        result = self.run_cli("levels", "ghost", "2", "--no-wait")
+        self.assertEqual(result.code, 4)
+        self.assertEqual(len(self.state.requests), 1)
+
+    def test_one_level_answer_for_another_level_is_refused(self):
+        ok = stub_server.Handler._ok
+        with mock.patch.object(stub_server.Handler, "_ok",
+                               lambda handler, body: ok(handler, dict(body, idx=3))):
+            result = self.run_cli("levels", "ghost", "2")
+        self.assertEqual(result.code, 1)
+        self.assertIn("unexpected shape", result.err)
 
     def test_unknown_track(self):
         result = self.run_cli("levels", "nope")
@@ -324,20 +689,85 @@ class ReadTests(CliCase):
         result = self.run_cli("status")
         self.assertEqual(result.code, 0, result.err)
         lines = result.out.splitlines()
-        self.assertIn("operator_01  1200 points  12 solved", lines[0])
-        self.assertEqual(lines[2].split(), ["TRACK", "SOLVED", "POINTS", "ACCESS", "NEXT", "LEVEL"])
-        self.assertEqual(lines[3].split(), ["ghost", "2/5", "210", "free", "2", "Ghost", "Level", "2"])
-        self.assertEqual(lines[4].split(), ["phantom", "0/3", "0", "locked", "not", "open", "to", "your", "account"])
+        self.assertEqual(lines[0], "operator_01  1200 points  12 solved  rank 42 on the humans board")
+        self.assertEqual(lines[2].split(), ["TRACK", "NAME", "SOLVED", "ACCESS", "NEXT", "LEVEL"])
+        self.assertEqual(lines[3].split(), ["ghost", "Ghost", "2/5", "free", "2"])
+        self.assertEqual(lines[4].split(), ["phantom", "Phantom", "0/3", "locked", "not", "open",
+                                            "to", "your", "account"])
+        # The account and one call for every track's progress, whatever their number.
+        self.assertEqual(self.calls(), [("GET", "/api/v2/me"), ("GET", "/api/v2/me/progress")])
+
+    def test_status_on_an_old_server_uses_tracks_and_levels(self):
+        new = self.run_cli("status")
+        new_json = self.run_cli("status", "--json").json()
+        for missing_status in (404, 405):
+            self.state.requests[:] = []
+            self.old_server(missing_status)
+            old = self.run_cli("status")
+            self.assertEqual(old.code, 0, old.err)
+            self.assertEqual(old.err, "")
+            self.assertEqual(self.paths(), [
+                "/api/v2/me", "/api/v2/me/progress", "/api/v2/tracks",
+                "/api/v2/tracks/ghost/levels", "/api/v2/tracks/phantom/levels"])
+            lines = old.out.splitlines()
+            self.assertEqual(lines[0], "operator_01  1200 points  12 solved")
+            # The table is the same one a current server produces.
+            self.assertEqual(lines[1:], new.out.splitlines()[1:])
+            old_json = self.run_cli("status", "--json").json()
+            self.assertEqual(old_json["tracks"], new_json["tracks"])
+            self.assertNotIn("leaderboard", old_json["account"])
 
     def test_status_json_and_completed_track(self):
         self.state.levels["ghost"] = stub_server.make_levels("ghost", 5, 5)
         data = self.run_cli("status", "--json").json()
+        self.assertEqual(data["object"], "status")
         ghost, phantom = data["tracks"]
-        self.assertEqual((ghost["solved"], ghost["levels"], ghost["completed"]), (5, 5, True))
-        self.assertIsNone(ghost["next_level"])
-        self.assertEqual(phantom["completed"], False)
+        self.assertEqual(ghost, {"object": "track_progress", "track": "ghost", "name": "Ghost",
+                                 "access": "free", "level_count": 5, "solved": 5,
+                                 "next_level_idx": None})
+        self.assertEqual((phantom["solved"], phantom["level_count"]), (0, 3))
         self.assertEqual(data["account"]["username"], "operator_01")
         self.assertIn("complete", self.run_cli("status").out)
+        self.old_server()
+        self.assertEqual(self.run_cli("status", "--json").json()["tracks"], data["tracks"])
+        self.assertIn("complete", self.run_cli("status").out)
+
+    def test_status_next_level_wording(self):
+        self.state.levels["phantom"][0]["status"] = "available"
+        self.state.levels["ghost"] = []
+        self.state.tracks.append({"object": "track", "slug": "specter", "name": "Spec\x1bter",
+                                  "status": "live", "level_count": 2, "access": "paid",
+                                  "difficulty_mix": {}})
+        self.state.levels["specter"] = stub_server.make_levels("specter", 2, 0)
+        for level in self.state.levels["specter"]:
+            level["status"] = "locked"
+        for old in (False, True):
+            if old:
+                self.old_server()
+            result = self.run_cli("status")
+            self.assertEqual(result.code, 0, result.err)
+            lines = result.out.splitlines()
+            self.assertTrue(lines[3].endswith("0/0  free    no levels yet"), lines[3])
+            self.assertTrue(lines[4].endswith("0/3  locked  0, not open to your account"), lines[4])
+            self.assertTrue(lines[5].endswith("0/2  paid    locked"), lines[5])
+            self.assertIn("Spec?ter", lines[5])
+            self.assertNotIn("\x1b", result.out)
+
+    def test_status_other_errors_do_not_fall_back(self):
+        self.state.rate_limit_next = 2
+        result = self.run_cli("status", "--no-wait")
+        self.assertEqual(result.code, 4)
+        self.assertEqual(self.paths(), ["/api/v2/me"])
+
+    def test_status_survives_odd_progress_values(self):
+        self.state.tracks[0]["name"] = None
+        self.state.levels["ghost"][0]["status"] = None
+        with mock.patch.object(stub_server.Handler, "_progress", lambda handler: [
+                {"object": "track_progress", "track": "ghost", "name": None, "access": None,
+                 "level_count": "5", "solved": -2, "next_level_idx": True}, "junk"]):
+            result = self.run_cli("status")
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("ghost", result.out)
 
     def test_leaderboard_default_is_one_page_of_twenty(self):
         result = self.run_cli("leaderboard")

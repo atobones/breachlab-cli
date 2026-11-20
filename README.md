@@ -38,12 +38,14 @@ Next: breachlab status
 
 ```
 $ breachlab status
-operator_01  210 points  2 solved
+operator_01  210 points  2 solved  rank 42 on the humans board
 
-TRACK    SOLVED  POINTS  ACCESS  NEXT LEVEL
-ghost       2/5     210  free    2 Dash Dash
-phantom     0/3       0  locked  not open to your account
+TRACK    NAME     SOLVED  ACCESS  NEXT LEVEL
+ghost    Ghost       2/5  free    2
+phantom  Phantom     0/3  locked  not open to your account
 ```
+
+`breachlab levels ghost 2` prints the briefing of that next level.
 
 **3. Check that submitting works.** The test flag always answers correct and records nothing.
 
@@ -69,17 +71,60 @@ Every command accepts `--help`.
 
 Starts the device flow, waits for you to approve it in the browser, then saves the token. See the quickstart for the output.
 
-`breachlab login --read-only` asks for a token that can read but cannot submit.
+A token from a plain `breachlab login` carries the scopes `read` and `submit`. `breachlab login --read-only` asks for a token that can read but cannot submit.
+
+`breachlab login --scope` asks for exactly the scopes you name, separated by commas or spaces. The names are sent to the server as they are, and the server decides which ones it grants. `play` is an optional scope that lets a token fetch the connection details of a level.
+
+```
+$ breachlab login --scope read,submit,play
+Open this page in a browser, sign in and approve the request:
+
+  https://breachlab.org/activate?code=GX50-R07J
+
+Code: GX50-R07J
+The code expires in 10 minutes. Waiting for approval. Press Ctrl+C to cancel.
+
+Logged in as operator_01. Token saved to ~/.config/breachlab/token.
+Granted scopes: read, submit, play.
+Next: breachlab status
+```
+
+A server that does not grant a scope refuses the whole request, and nothing is saved:
+
+```
+$ breachlab login --scope read,submit,play
+breachlab: The server refused the requested scope. Allowed scopes: read, submit. Code: invalid_scope. Docs: https://breachlab.org/docs/api/errors/invalid_scope
+```
+
+When the request is denied or the code runs out, the error carries the server's reason and a link to its documentation:
+
+```
+$ breachlab login
+breachlab: The request was denied, or the account already holds the maximum number of active tokens. Nothing was saved. Docs: https://breachlab.org/docs/api/errors/access_denied
+```
 
 ### logout
+
+Revokes the saved token on the server, then deletes the token file.
+
+```
+$ breachlab logout
+Logged out. The token was revoked on the server and removed from ~/.config/breachlab/token.
+```
+
+The file is deleted even when the token cannot be revoked. That happens when the server does not have the revoke endpoint yet, cannot be reached or answers with an error. The command then says that the token may still be valid and where to revoke it yourself, and still exits with 0:
 
 ```
 $ breachlab logout
 Logged out. The token was removed from ~/.config/breachlab/token.
-It stays valid on the server until you revoke it at https://breachlab.org/dashboard/account
+This server cannot revoke tokens yet, so the token may still be valid. Revoke it by hand at https://breachlab.org/dashboard/account
 ```
 
+A token the server no longer accepts counts as revoked. `logout` acts on the saved token only. It never revokes the token in `BREACHLAB_TOKEN`.
+
 ### whoami
+
+The account, its place on the leaderboard, and what the token may do.
 
 ```
 $ breachlab whoami
@@ -87,7 +132,26 @@ User          operator_01
 Points        210
 Solved        2
 Subscription  inactive
+Rank          42 on the humans board
 Token         ~/.config/breachlab/token
+Scopes        read, submit
+Expires       never
+```
+
+`Rank` is left out for an account that is not ranked. A token without the `submit` scope is called out:
+
+```
+$ breachlab whoami
+User          operator_01
+Points        210
+Solved        2
+Subscription  inactive
+Rank          42 on the humans board
+Token         ~/.config/breachlab/token
+Scopes        read
+Expires       never
+
+This token cannot submit flags. Run "breachlab login" to get one that can.
 ```
 
 ### tracks
@@ -127,7 +191,7 @@ Log in as ghost2 and read it.
 
 ### status
 
-Your progress on every live track and the next level you can attempt. See the quickstart for the output.
+Your progress on every live track, the number of the next level you can attempt, and your rank when you have one. See the quickstart for the output.
 
 ### submit
 
@@ -196,7 +260,59 @@ $ breachlab submit --json 'BL{not_the_flag}'
 }
 ```
 
-Lists come back as `{"object": "list", "data": [...], "has_more": false}` with every page already merged. `status --json` returns the account and one entry per track with `solved`, `levels`, `completed` and `next_level`.
+Lists come back as `{"object": "list", "data": [...], "has_more": false}` with every page already merged.
+
+`status --json` returns the account and one `track_progress` object per track:
+
+```
+$ breachlab status --json
+{
+  "object": "status",
+  "account": {
+    "object": "account",
+    "username": "operator_01",
+    "is_agent": false,
+    "agent": null,
+    "points": 210,
+    "solved": 2,
+    "leaderboard": {
+      "board": "humans",
+      "rank": 42,
+      "points": 210
+    },
+    "access": {
+      "paywall_enabled": true,
+      "subscription_active": false,
+      "tracks": {
+        "ghost": "free",
+        "phantom": "locked"
+      }
+    }
+  },
+  "tracks": [
+    {
+      "object": "track_progress",
+      "track": "ghost",
+      "name": "Ghost",
+      "access": "free",
+      "level_count": 5,
+      "solved": 2,
+      "next_level_idx": 2
+    },
+    {
+      "object": "track_progress",
+      "track": "phantom",
+      "name": "Phantom",
+      "access": "locked",
+      "level_count": 3,
+      "solved": 0,
+      "next_level_idx": null
+    }
+  ]
+}
+```
+
+`whoami --json` returns the account object with one added key, `token`, that holds the API's token object: `scopes`, `created_at`, `expires_at` and `is_agent`. `logout --json` returns `logged_out`, `revoked`, `revocation` and `token_path`, plus `revoke_url` when the token may still be valid.
 
 On failure the one line error still goes to standard error, and standard output carries a JSON error:
 
@@ -225,6 +341,19 @@ elif [ $? -eq 4 ]; then
 fi
 ```
 
+## Older servers
+
+Version 0.2.0 uses API endpoints that are newer than the client's first release: token details, token revocation, progress in one call, a single level, and the account's rank. When a server answers 404 or 405 on one of them, the command falls back to what 0.1.0 did, so the same client works against both.
+
+| Command | Current server | Older server |
+| ------- | -------------- | ------------ |
+| `logout` | Revokes the token, then deletes the file. | Deletes the file and tells you to revoke the token by hand. |
+| `whoami` | Shows scopes, expiry and rank. | Leaves those rows out. With `--json`, `token` is `null`. |
+| `status` | One request for all tracks. | One request for the track list and one or more for each track. The table is the same. |
+| `levels <track> <n>` | One request for that level. | Pages the level list and picks the level. The output is the same. |
+
+The fallback shows in `--debug` as a 404 or 405 followed by the older requests.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -247,9 +376,9 @@ The API allows 60 reads per minute for each token. When a read is limited and th
 - The file has mode `0600` and its directory `0700`. The file is written to a temporary name and renamed into place, so it is never half written and never readable by other users.
 - `BREACHLAB_TOKEN` overrides the saved token. This suits CI and containers.
 - The token is sent only in the `Authorization` header and never to a host that a redirect points to. The connection is always https, except for a test server on localhost. It is never printed, and `--debug` shows it as `***`.
-- `breachlab logout` deletes the file. To revoke the token on the server, open https://breachlab.org/dashboard/account.
+- `breachlab logout` revokes the token on the server and deletes the file. The revoke request carries the token in the `Authorization` header like every other request.
 
-Treat the token like a password. If it leaks, revoke it.
+Treat the token like a password. If it leaks, run `breachlab logout` or revoke it at https://breachlab.org/dashboard/account.
 
 ## Environment
 
@@ -269,7 +398,7 @@ $ breachlab --debug whoami
 debug: > GET https://breachlab.org/api/v2/me
 debug: > Accept: application/json
 debug: > Authorization: Bearer ***
-debug: > User-Agent: breachlab-cli/0.1.0
+debug: > User-Agent: breachlab-cli/0.2.0
 debug: < HTTP 401 in 170 ms
 debug: < Content-Type: application/problem+json
 debug: < Request-Id: req_mw90qex71i4dxly5ybsttab9
@@ -286,4 +415,8 @@ API documentation: https://breachlab.org/docs/api
 python -m unittest
 ```
 
-The tests start a local stub of the API on 127.0.0.1 and need no network and no account. The stub lives in `tests/stub_server.py` and follows the shapes of https://breachlab.org/api/v2/openapi.json.
+The tests start a local stub of the API on 127.0.0.1 and need no network and no account. The stub lives in `tests/stub_server.py` and follows the shapes of https://breachlab.org/api/v2/openapi.json. Setting `new_endpoints` to false on its state turns it into a server without the newer endpoints, which is how the fallback paths are tested.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
