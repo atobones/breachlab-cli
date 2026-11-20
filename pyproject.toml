@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "breachlab"
+dynamic = ["version"]
+description = "Command-line client for BreachLab: submit flags and check your progress from the terminal."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+authors = [{ name = "BreachLab" }]
+keywords = ["breachlab", "ctf", "wargame", "security", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://breachlab.org"
+Documentation = "https://breachlab.org/docs/api"
+
+[project.scripts]
+breachlab = "breachlab.cli:run"
+
+[tool.setuptools.dynamic]
+version = { attr = "breachlab.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
