@@ -3,7 +3,7 @@
 Command line client and Python SDK for the [BreachLab](https://breachlab.org) API.
 
 ```
-$ breachlab submit 'BL{...}'
+$ breachlab submit "$FLAG"
 Correct. ghost level 2 solved, 120 points awarded. First blood.
 ```
 

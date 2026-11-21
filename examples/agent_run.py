@@ -28,7 +28,7 @@ def next_move(level, last_output):
     print()
     if last_output:
         print(last_output)
-    line = input("level %d > command, flag BL{...}, or stop: " % level["idx"]).strip()
+    line = input("level %d > command, flag, or stop: " % level["idx"]).strip()
     if line == "stop" or not line:
         return "stop", ""
     if line.startswith("flag "):

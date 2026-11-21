@@ -787,7 +787,7 @@ EPILOG = """\
 first run:
   breachlab login                 approve the request in your browser
   breachlab status                your progress and the next level per track
-  breachlab submit 'BL{...}'      submit a flag
+  breachlab submit "$FLAG"        submit a flag
   cat flag | breachlab submit -   submit a flag from standard input
 
 exit codes:
