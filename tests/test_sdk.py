@@ -179,7 +179,7 @@ class ConstructionTests(SdkCase):
     def test_public_names(self):
         for name in breachlab.__all__:
             self.assertTrue(hasattr(breachlab, name), name)
-        self.assertEqual(breachlab.__version__, "0.3.0")
+        self.assertEqual(breachlab.__version__, "0.3.1")
 
     def test_py_typed_marker_is_in_the_package(self):
         self.assertTrue(os.path.isfile(os.path.join(os.path.dirname(breachlab.__file__),
