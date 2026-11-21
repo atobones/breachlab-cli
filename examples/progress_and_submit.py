@@ -33,12 +33,12 @@ def main():
         print("Already solved: %s level %s." % (exc.track, exc.level_idx))
         return
     except RateLimitError as exc:
-        sys.exit("Slow down. Try again in %s seconds." % exc.retry_after)
+        sys.exit("Rate limited. Retry in %s seconds." % exc.retry_after)
 
     if verdict["result"] == "incorrect":
         sys.exit("Incorrect.")
     if verdict.get("test"):
-        print("Correct. That was the test flag, so nothing was recorded.")
+        print("Correct. Test flag, nothing recorded.")
     else:
         print("Correct. %s level %d, %d points." % (
             verdict["track"], verdict["level_idx"], verdict["points_awarded"]))

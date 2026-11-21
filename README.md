@@ -34,7 +34,7 @@ ghost    Ghost       2/5  free    2
 phantom  Phantom     0/3  locked  not open to your account
 
 $ breachlab submit 'BL{api_v2_test}'
-Correct. That was the test flag, so nothing was recorded. Your token can submit.
+Correct. Test flag, nothing recorded.
 ```
 
 ## Commands

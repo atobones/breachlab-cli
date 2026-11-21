@@ -264,7 +264,7 @@ class BreachLab:
                 raw = response.read(MAX_BODY + 1)
         except (socket.timeout, TimeoutError):
             raise NetworkError(
-                "The API did not answer within %g seconds. Check your connection and try again."
+                "The API did not answer within %g seconds."
                 % self.timeout
             )
         except ssl.SSLError as exc:
@@ -272,7 +272,7 @@ class BreachLab:
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (socket.timeout, TimeoutError)):
                 raise NetworkError(
-                    "The API did not answer within %g seconds. Check your connection and try again."
+                    "The API did not answer within %g seconds."
                     % self.timeout
                 )
             raise NetworkError("Could not reach the API at %s: %s." % (self.base_url, _reason(exc)))

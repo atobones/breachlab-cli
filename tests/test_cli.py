@@ -845,7 +845,7 @@ class SubmitTests(CliCase):
     def test_test_flag(self):
         result = self.run_cli("submit", TEST_FLAG)
         self.assertEqual(result.code, 0, result.err)
-        self.assertIn("test flag", result.out)
+        self.assertIn("Test flag", result.out)
 
     def test_wrong_flag(self):
         result = self.run_cli("submit", "BL{nope}")
@@ -887,7 +887,7 @@ class SubmitTests(CliCase):
     def test_already_solved(self):
         result = self.run_cli("submit", SOLVED_FLAG)
         self.assertEqual(result.code, 1)
-        self.assertIn("already solved", result.err)
+        self.assertIn("Already solved", result.err)
         self.assertIn("Code: already_solved.", result.err)
 
     def test_email_unverified(self):
@@ -1042,7 +1042,7 @@ class RobustnessTests(CliCase):
             loud = self.run_cli("tracks", "--debug")
         self.assertEqual(result.code, 1)
         self.assertNotIn("Traceback", result.err)
-        self.assertIn("Run again with --debug", result.err)
+        self.assertIn("See --debug", result.err)
         self.assertIn("Traceback", loud.err)
 
     def test_usage_errors_exit_2(self):
