@@ -9,6 +9,8 @@ import re
 import stat
 import tempfile
 
+from breachlab.errors import TokenError  # noqa: F401
+
 DEFAULT_API = "https://breachlab.org"
 ENV_TOKEN = "BREACHLAB_TOKEN"
 ENV_API = "BREACHLAB_API"
@@ -16,10 +18,6 @@ ENV_API = "BREACHLAB_API"
 # "blp_" followed by URL-safe base64. The strict shape also guarantees the
 # value can never smuggle a newline into the Authorization header.
 TOKEN_RE = re.compile(r"^blp_[A-Za-z0-9_-]{8,512}$")
-
-
-class TokenError(Exception):
-    """The stored or supplied token cannot be used."""
 
 
 def config_dir():
