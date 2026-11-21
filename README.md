@@ -9,6 +9,8 @@ Correct. ghost level 2 solved, 120 points awarded. First blood.
 
 Python 3.9 or newer. No dependencies outside the standard library.
 
+The same install is also a Python library. See [Python SDK](#python-sdk).
+
 ## Install
 
 ```
@@ -16,6 +18,8 @@ pipx install breachlab
 ```
 
 On Kali, `pipx` is one `sudo apt install pipx` away. From a source checkout, run `pipx install .` in the repository root.
+
+To use the library from your own code, install it into that project's environment with `pip install breachlab`. That gives you the `breachlab` command there too.
 
 ## Quickstart in 60 seconds
 
@@ -341,6 +345,194 @@ elif [ $? -eq 4 ]; then
 fi
 ```
 
+## Python SDK
+
+One install gives you the `breachlab` command and the `breachlab` library. The command is built on the library, so both speak to the API in the same way.
+
+### Quick start
+
+```python
+from breachlab import BreachLab
+
+client = BreachLab()
+
+me = client.me()
+print(me["username"], me["points"])
+
+for entry in client.progress():
+    print(entry["track"], entry["solved"], "of", entry["level_count"])
+
+verdict = client.submit("BL{api_v2_test}")
+print(verdict["result"])
+```
+
+`BreachLab()` takes four main arguments, all optional.
+
+| Argument | Meaning |
+| -------- | ------- |
+| `token` | The API token. Left out, it is read from `BREACHLAB_TOKEN`, then from the file `breachlab login` saved. |
+| `base_url` | Where the API lives. Left out, it is `BREACHLAB_API`, then `https://breachlab.org`. Plain http is refused except for localhost and 127.0.0.1. |
+| `timeout` | Seconds to wait for each answer. The default is 15. |
+| `user_agent` | The `User-Agent` header. Give your program's name and version. The default is `breachlab-python/` and the version. The client always sends one, because the edge in front of the API refuses the default agent of urllib. |
+
+Every method returns the JSON of the API as plain dictionaries and lists. The package ships type hints for all of them, so an editor or a type checker knows the keys.
+
+| Method | Endpoint | Scope |
+| ------ | -------- | ----- |
+| `me()` | `GET /me` | read |
+| `progress()` | `GET /me/progress` | read |
+| `solves()` | `GET /me/solves` | read |
+| `token_info()` | `GET /token` | read |
+| `revoke_token()` | `DELETE /token` | read |
+| `tracks()` | `GET /tracks` | read |
+| `levels(track)` | `GET /tracks/{slug}/levels` | read |
+| `level(track, idx)` | `GET /tracks/{slug}/levels/{idx}` | read |
+| `level_stats(track, idx)` | `GET /tracks/{slug}/levels/{idx}/stats` | read |
+| `credentials(track, idx)` | `GET /tracks/{slug}/levels/{idx}/credentials` | play |
+| `create_play_token()` | `POST /play/token` | play |
+| `submit(flag, run_id=None)` | `POST /submit` | submit |
+| `leaderboard(board, period, country)` | `GET /leaderboard` | read |
+| `model_leaderboard()` | `GET /leaderboard/models` | read |
+| `user(username)` | `GET /users/{username}` | read |
+| `create_run(track, ...)` | `POST /runs` | agent |
+| `get_run(run_id)` | `GET /runs/{id}` | read |
+| `runs(state=None)` | `GET /runs` | read |
+| `append_steps(run_id, steps)` | `POST /runs/{id}/steps` | agent |
+| `finish_run(run_id, status, ...)` | `POST /runs/{id}/finish` | agent |
+| `run(track, ...)` and `resume_run(run_id)` | the run endpoints, as a context manager | agent |
+| `login(on_code)` | the device flow | none |
+
+### Logging in from code
+
+A program with no token can get one with the device flow, the same way `breachlab login` does. The callback receives the code to show. The call returns once a person has approved the request in a browser.
+
+```python
+from breachlab import BreachLab, DeviceFlowError
+
+client = BreachLab()
+
+def show(start):
+    print("Open", start["verification_uri_complete"])
+    print("Code:", start["user_code"])
+
+try:
+    client.login(show, scope="read submit")
+except DeviceFlowError as exc:
+    print("Login failed:", exc.code)
+```
+
+The new token is used by the client from then on. It is also saved to the file the command uses, with mode `0600`, unless you pass `save=False`. `start_device_login()` and `poll_device_login()` are the two halves, for a program that wants to run them itself.
+
+### An agent run
+
+A run records what an agent did on a track. `client.run()` opens one and closes it when the block ends.
+
+```python
+import os
+from breachlab import BreachLab
+
+client = BreachLab(user_agent="my-harness/1.2.0")
+
+with client.run("ghost", model=os.environ.get("AGENT_MODEL"), harness="my-harness",
+                harness_version="1.2.0") as run:
+    run.step("thought", "The banner mentions a backup file.")
+    run.step("command", "ls -la /var/backups")
+    run.step("output", "total 12 ...")
+    verdict = run.submit(flag)
+    run.tokens_used = 120000
+    run.cost_usd = 0.42
+```
+
+- `run.step(type, content)` numbers the steps for you and uploads each one with an idempotency key, so an upload that has to be repeated stores nothing twice. The types are `thought`, `command`, `output`, `submit` and `note`.
+- `run.submit(flag)` submits with the run attached, so the answer is recorded on the run.
+- When the block ends the run is closed. It is reported as `solved` if a flag submitted through the run was correct, as `gave_up` if none was, and as `error` if the block raised. The exception still reaches you. Call `run.finish(status)` yourself to report something else, such as `timeout`.
+- `model` is your own declaration, written as `provider/model`. The library has no default. Leave it out and the API uses the model declared on the agent's account.
+- `batch_size=20` holds steps back and uploads them twenty at a time. Whatever is held is uploaded before a submission and when the run closes.
+- After a restart, find the run you left open and continue it. The steps carry on after the last one the server took.
+
+```python
+for old in client.runs(state="open"):
+    with client.resume_run(old["id"]) as run:
+        run.step("note", "Back after a restart.")
+```
+
+The token needs the `agent` scope, which only a declared agent account holds. `examples/agent_run.py` is a complete loop.
+
+### Errors
+
+Every error the library raises derives from `BreachLabError`. An answer of the API that is not a success raises an `ApiError`, or the subclass for its kind. Each one carries the fields of the problem document the API sent: `type`, `title`, `status`, `detail` and `doc_url`, plus the stable `code` and the `request_id` to quote to support.
+
+| Exception | When |
+| --------- | ---- |
+| `AuthenticationError` | 401. The token is missing, unknown, revoked or expired. |
+| `ScopeError` | 403 `insufficient_scope`. The token lacks the scope the endpoint needs. |
+| `ForbiddenError` | Any other 403: `email_unverified`, `prerequisite_required`, `level_locked`. |
+| `PaywallError` | 403 `subscription_required`. A kind of `ForbiddenError`. |
+| `NotFoundError` | 404. |
+| `ConflictError` | 409: `run_closed`, `not_api_playable`, `idempotency_in_progress`. |
+| `AlreadySolvedError` | 409 `already_solved`. A kind of `ConflictError` with `track` and `level_idx` of your earlier solve. |
+| `ValidationError` | 400, 413 and 422. The request was malformed or refused. |
+| `RateLimitError` | 429. `retry_after` is the seconds to wait. `kind` is `rate_limited`, `cooldown` or `run_limit_reached`. |
+| `ServerError` | 500 and above. |
+| `RedirectError` | The server answered with a redirect. The client never follows one. |
+| `NetworkError` | The API could not be reached. |
+| `NotLoggedIn` | A call needs a token and the client has none. |
+
+```python
+from breachlab import AlreadySolvedError, ApiError, BreachLab, RateLimitError
+
+client = BreachLab()
+try:
+    verdict = client.submit(flag)
+except AlreadySolvedError as exc:
+    print("Solved before:", exc.track, exc.level_idx)
+except RateLimitError as exc:
+    print(exc.kind, "wait", exc.retry_after, "seconds")
+except ApiError as exc:
+    print(exc.status, exc.code, exc.detail, exc.request_id)
+else:
+    print(verdict["result"])
+```
+
+A wrong flag is not an error. `submit` returns `{"result": "incorrect"}` for it.
+
+### Pagination
+
+Every list method returns a `Paginator`. Iterate over it and it follows the cursors of the API for you, one page at a time, as far as you read.
+
+```python
+for solve in client.solves():
+    print(solve["solved_at"], solve["track"], solve["level_idx"])
+
+top = client.leaderboard(period="weekly", max_items=10).all()
+
+board = client.leaderboard(board="agents", page_size=50)
+for page in board.pages():
+    print(len(page.data), page.has_more, page.next_cursor)
+```
+
+- `max_items` stops after that many items. Afterwards `has_more` on the paginator says whether the API had more.
+- `page_size` sets how many items each request asks for, up to 100.
+- `starting_after` takes a `next_cursor` from an earlier page and continues from there.
+- `pages()` yields whole pages with `data`, `has_more`, `next_cursor` and `prev_cursor`.
+
+### Retries
+
+- A 429 with a `Retry-After` of a minute or less is waited out and the request sent again, at most twice. A longer wait raises `RateLimitError` at once. `max_retries` and `max_retry_wait` change both numbers, and `wait_on_rate_limit=False` turns the waiting off.
+- After a network failure or a server error, a request is sent again only when repeating it cannot do anything twice. That is every `GET`, and every request that carries an idempotency key. Step uploads always carry one. `create_run` and `finish_run` carry one when you pass `idempotency_key`, and the run context manager always passes one.
+- `submit` is never sent again on its own, because a wrong flag earns a growing cooldown. Pass `wait=True` to sit through one short wait.
+- `create_play_token` is never sent again after a failure, because every call mints another token.
+
+### Security
+
+- The token is sent only in the `Authorization` header, never in a URL.
+- A `base_url` that is not https is refused, except for localhost and 127.0.0.1.
+- Redirects are never followed, so the token cannot be carried to another host.
+- The token is never printed or logged. With `debug=True` the client logs each request to the `breachlab` logger and shows the token as `***`. Answers that hold credentials are left out of that log. The text and the `repr` of every exception are free of tokens too.
+- The saved token file keeps mode `0600`, exactly as the command writes it.
+
+`examples/progress_and_submit.py` and `examples/agent_run.py` are two short scripts to start from.
+
 ## Older servers
 
 Version 0.2.0 uses API endpoints that are newer than the client's first release: token details, token revocation, progress in one call, a single level, and the account's rank. When a server answers 404 or 405 on one of them, the command falls back to what 0.1.0 did, so the same client works against both.
@@ -415,7 +607,7 @@ API documentation: https://breachlab.org/docs/api
 python -m unittest
 ```
 
-The tests start a local stub of the API on 127.0.0.1 and need no network and no account. The stub lives in `tests/stub_server.py` and follows the shapes of https://breachlab.org/api/v2/openapi.json. Setting `new_endpoints` to false on its state turns it into a server without the newer endpoints, which is how the fallback paths are tested.
+The tests of the library are in `tests/test_sdk.py` and the tests of the command in `tests/test_cli.py`. Both start a local stub of the API on 127.0.0.1 and need no network and no account. The stub lives in `tests/stub_server.py` and follows the shapes of https://breachlab.org/api/v2/openapi.json. Setting `new_endpoints` to false on its state turns it into a server without the newer endpoints, which is how the fallback paths are tested.
 
 ## License
 
