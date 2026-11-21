@@ -255,7 +255,7 @@ def error_from(status: int, headers: Any, payload: Any) -> ApiError:
     elif status == 404:
         detail = "The server has no such API endpoint. Check the base URL."
     elif status >= 500:
-        detail = "The server is having trouble. Try again in a moment."
+        detail = "Server error."
     else:
         detail = "The server sent an unexpected answer."
     code = "http_%d" % status

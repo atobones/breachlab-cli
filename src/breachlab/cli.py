@@ -139,7 +139,7 @@ def cmd_login(ctx):
     tell("  " + style.paint(clean(url), "cyan"))
     tell()
     tell("Code: " + style.paint(clean(user_code), "bold"))
-    tell("The code expires in %s. Waiting for approval. Press Ctrl+C to cancel."
+    tell("Expires in %s. Waiting for approval."
          % _duration(expires_in))
 
     granted = _poll_for_token(client, device_code, interval, expires_in)
@@ -175,9 +175,8 @@ def cmd_login(ctx):
             ctx.say("Granted scopes: %s." % (clean(", ".join(granted_scope.split())) or "none"))
         if "submit" not in granted_scope.split():
             ctx.say("This token can read but cannot submit flags.")
-        ctx.say("Next: breachlab status")
     if env_set:
-        ctx.note("Note: %s is set and takes priority over the saved token." % config.ENV_TOKEN)
+        ctx.note("%s is set and overrides the saved token." % config.ENV_TOKEN)
     return EXIT_OK
 
 
@@ -595,13 +594,13 @@ def cmd_submit(ctx):
         return EXIT_OK if verdict == "correct" else EXIT_REFUSED
 
     if verdict == "incorrect":
-        ctx.say("%s The API does not say whether the flag is wrong or its level is not open to you."
+        ctx.say("%s Wrong flag, or the level is not open to you."
                 % ctx.style.paint("Incorrect.", "red"))
         return EXIT_REFUSED
 
     good = ctx.style.paint("Correct.", "green")
     if result.get("test") is True:
-        ctx.say("%s That was the test flag, so nothing was recorded. Your token can submit." % good)
+        ctx.say("%s Test flag, nothing recorded." % good)
         return EXIT_OK
     line = "%s %s level %s solved, %s points awarded." % (
         good, clean(result.get("track")), result.get("level_idx"), result.get("points_awarded", 0))
@@ -698,7 +697,7 @@ def cmd_solves(ctx):
         ctx.emit({"object": "list", "data": solves, "has_more": more})
         return EXIT_OK
     if not solves:
-        ctx.say("No solves yet. Run \"breachlab status\" to see where to start.")
+        ctx.say("No solves yet.")
         return EXIT_OK
     rows = []
     for solve in solves:
@@ -928,7 +927,7 @@ def _report_api_error(ctx, exc):
     elif exc.status == 429:
         exit_code = EXIT_RATE_LIMITED
         if exc.code == "cooldown":
-            message = "You are submitting too fast."
+            message = "Submitting too fast."
         else:
             message = "Rate limited."
         if exc.retry_after is not None:
@@ -938,7 +937,7 @@ def _report_api_error(ctx, exc):
         else:
             message += " The API did not say how long to wait."
     elif exc.code == "already_solved":
-        message = "You already solved that level, so it cannot be scored again."
+        message = "Already solved."
     elif exc.code == "email_unverified":
         message = "Verify your account's email address on breachlab.org before submitting flags."
 
@@ -981,7 +980,7 @@ def main(argv=None):
         if ctx.debug:
             traceback.print_exc(file=ctx.err)
         return _report(
-            ctx, "Unexpected error: %s. Run again with --debug for details." % exc.__class__.__name__,
+            ctx, "Unexpected error: %s. See --debug." % exc.__class__.__name__,
             EXIT_REFUSED, code="internal")
 
 
