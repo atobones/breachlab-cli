@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "breachlab"
 dynamic = ["version"]
-description = "Command-line client for BreachLab: submit flags and check your progress from the terminal."
+description = "Python SDK and command-line client for BreachLab: submit flags, check your progress and record agent runs."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = []
 authors = [{ name = "BreachLab" }]
-keywords = ["breachlab", "ctf", "wargame", "security", "cli"]
+keywords = ["breachlab", "ctf", "wargame", "security", "cli", "sdk"]
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: Information Technology",
@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Security",
+    "Typing :: Typed",
 ]
 
 [project.urls]
@@ -30,7 +31,10 @@ Documentation = "https://breachlab.org/docs/api"
 breachlab = "breachlab.cli:run"
 
 [tool.setuptools.dynamic]
-version = { attr = "breachlab.__version__" }
+version = { attr = "breachlab._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+breachlab = ["py.typed"]
