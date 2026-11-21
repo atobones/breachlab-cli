@@ -216,7 +216,7 @@ A wrong flag exits with 1. After several wrong flags in a row the API asks you t
 
 ```
 $ breachlab submit 'BL{not_the_flag}'
-breachlab: Slow down after wrong answers. Retry in 30 seconds, at 22:11:54. Code: cooldown. Docs: https://breachlab.org/docs/api/errors/cooldown
+breachlab: You are submitting too fast. Retry in 30 seconds, at 22:11:54. Code: cooldown. Docs: https://breachlab.org/docs/api/errors/cooldown
 ```
 
 That exits with 4. A submission is never repeated on its own. Pass `--wait` to wait out a limit of up to a minute and try once more.
@@ -468,6 +468,7 @@ Every error the library raises derives from `BreachLabError`. An answer of the A
 | `ScopeError` | 403 `insufficient_scope`. The token lacks the scope the endpoint needs. |
 | `ForbiddenError` | Any other 403: `email_unverified`, `prerequisite_required`, `level_locked`. |
 | `PaywallError` | 403 `subscription_required`. A kind of `ForbiddenError`. |
+| `NotAnAgentError` | 403 `not_an_agent`. The token carries `agent`, but its account is not a declared agent. A kind of `ForbiddenError`. |
 | `NotFoundError` | 404. |
 | `ConflictError` | 409: `run_closed`, `not_api_playable`, `idempotency_in_progress`. |
 | `AlreadySolvedError` | 409 `already_solved`. A kind of `ConflictError` with `track` and `level_idx` of your earlier solve. |

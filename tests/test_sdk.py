@@ -37,6 +37,7 @@ from breachlab import (  # noqa: E402
     NotLoggedIn,
     Page,
     Paginator,
+    NotAnAgentError,
     PaywallError,
     RateLimitError,
     RedirectError,
@@ -554,6 +555,7 @@ class ErrorTests(SdkCase):
         (403, "prerequisite_required", ForbiddenError),
         (403, "level_locked", ForbiddenError),
         (403, "email_unverified", ForbiddenError),
+        (403, "not_an_agent", NotAnAgentError),
         (404, "not_found", NotFoundError),
         (404, "board_unavailable", NotFoundError),
         (409, "already_solved", AlreadySolvedError),
@@ -598,6 +600,8 @@ class ErrorTests(SdkCase):
 
     def test_paywall_is_a_kind_of_forbidden_and_scope_is_not(self):
         self.assertTrue(issubclass(PaywallError, ForbiddenError))
+        self.assertTrue(issubclass(NotAnAgentError, ForbiddenError))
+        self.assertFalse(issubclass(NotAnAgentError, ScopeError))
         self.assertFalse(issubclass(ScopeError, ForbiddenError))
         self.assertTrue(issubclass(AlreadySolvedError, ConflictError))
 
@@ -640,6 +644,19 @@ class ErrorTests(SdkCase):
             self.client.me()
         self.assertEqual((caught.exception.kind, caught.exception.retry_after),
                          ("rate_limited", None))
+
+    def test_the_per_ip_429_of_the_device_flow_says_how_long_and_why(self):
+        # Newer servers add a code, the wait and a doc link next to the message.
+        self.script.queue({"error": "Too many requests. Try again later.", "code": "rate_limited",
+                           "retry_after_seconds": 42,
+                           "doc_url": "https://breachlab.org/docs/api/errors/rate_limited"},
+                          429, {"Retry-After": "42"})
+        with self.assertRaises(RateLimitError) as caught:
+            self.client.me()
+        exc = caught.exception
+        self.assertEqual((exc.kind, exc.code, exc.retry_after), ("rate_limited", "rate_limited", 42))
+        self.assertEqual(exc.detail, "Too many requests. Try again later.")
+        self.assertEqual(exc.doc_url, "https://breachlab.org/docs/api/errors/rate_limited")
 
     def test_the_edge_block_of_an_unnamed_client(self):
         self.script.queue(b"error code: 1010", 403, {"Content-Type": "text/plain"})

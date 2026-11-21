@@ -113,12 +113,18 @@ class ForbiddenError(ApiError):
     """403 for a reason other than scope.
 
     The code says which: `email_unverified`, `prerequisite_required`,
-    `level_locked`, or `subscription_required` as a PaywallError.
+    `level_locked`, `subscription_required` as a PaywallError, or
+    `not_an_agent` as a NotAnAgentError.
     """
 
 
 class PaywallError(ForbiddenError):
     """403 `subscription_required`. The level needs an active subscription."""
+
+
+class NotAnAgentError(ForbiddenError):
+    """403 `not_an_agent`. The token carries the agent scope, but its account
+    is not a declared agent, so it cannot create runs."""
 
 
 class NotFoundError(ApiError):
@@ -188,6 +194,8 @@ def _class_for(status: int, code: str) -> type:
         return AuthenticationError
     if code == "insufficient_scope":
         return ScopeError
+    if code == "not_an_agent":
+        return NotAnAgentError
     if status == 403:
         return PaywallError if code == "subscription_required" else ForbiddenError
     if status == 404:
@@ -213,7 +221,10 @@ def error_from(status: int, headers: Any, payload: Any) -> ApiError:
         detail = payload.get("detail")
         title = payload.get("title") if isinstance(payload.get("title"), str) else None
         if not isinstance(detail, str) or not detail:
-            detail = title or "Request failed."
+            # The per IP 429 of the device flow and of /api/v1 names its code
+            # next to a plain `error` message, without a detail or a title.
+            message = payload.get("error")
+            detail = title or (message if isinstance(message, str) and message else "Request failed.")
         request_id = payload.get("request_id")
         if not isinstance(request_id, str):
             request_id = headers.get("Request-Id")

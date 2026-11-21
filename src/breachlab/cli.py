@@ -928,7 +928,7 @@ def _report_api_error(ctx, exc):
     elif exc.status == 429:
         exit_code = EXIT_RATE_LIMITED
         if exc.code == "cooldown":
-            message = "Slow down after wrong answers."
+            message = "You are submitting too fast."
         else:
             message = "Rate limited."
         if exc.retry_after is not None:
