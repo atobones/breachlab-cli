@@ -215,8 +215,13 @@ class BreachLab:
 
     def send(self, method: str, path: str, query: Optional[Mapping[str, Any]] = None,
              body: Any = None, auth: bool = True,
-             headers: Optional[Mapping[str, str]] = None) -> Tuple[int, Any, Any]:
-        """One HTTP exchange. Return (status, headers, parsed JSON or None)."""
+             headers: Optional[Mapping[str, str]] = None,
+             sensitive: bool = False) -> Tuple[int, Any, Any]:
+        """One HTTP exchange. Return (status, headers, parsed JSON or None).
+
+        `sensitive` keeps the body of the answer out of the debug output,
+        for the endpoints that hand out credentials.
+        """
         if not path.startswith("/"):
             # Anything else could turn the host of the base URL into a user name.
             raise ConfigError("An API path must start with a slash.")
@@ -281,7 +286,9 @@ class BreachLab:
             value = reply_headers.get(name)
             if value is not None:
                 self.debug("< %s: %s" % (name, value))
-        if text:
+        if text and sensitive and 200 <= status < 300:
+            self.debug("< (body withheld, it holds credentials)")
+        elif text:
             self.debug("< " + (text if len(text) <= 4000 else text[:4000] + " ..."))
 
         payload = None
@@ -294,7 +301,7 @@ class BreachLab:
 
     def call(self, method: str, path: str, query: Optional[Mapping[str, Any]] = None,
              body: Any = None, auth: bool = True, wait: Optional[bool] = None,
-             headers: Optional[Mapping[str, str]] = None) -> Any:
+             headers: Optional[Mapping[str, str]] = None, sensitive: bool = False) -> Any:
         """Send a request and return its JSON, raising ApiError on any failure.
 
         A 429 with a short Retry-After is waited out and the request sent
@@ -313,7 +320,8 @@ class BreachLab:
         while True:
             try:
                 status, reply, payload = self.send(method, path, query=query, body=body,
-                                                   auth=auth, headers=headers)
+                                                   auth=auth, headers=headers,
+                                                   sensitive=sensitive)
             except NetworkError:
                 if not repeatable or failures >= self.max_retries:
                     raise
@@ -419,7 +427,7 @@ class BreachLab:
         """
         answer = self._object(
             self.call("GET", "/api/v2/tracks/%s/levels/%d/credentials"
-                      % (_part(track), _index(idx))),
+                      % (_part(track), _index(idx)), sensitive=True),
             "connection details")
         if isinstance(answer.get("password"), str):
             self.add_secret(answer["password"])
@@ -434,7 +442,8 @@ class BreachLab:
         Every call mints another token, so this is never repeated after a
         failure.
         """
-        answer = self._object(self.call("POST", "/api/v2/play/token"), "a box token")
+        answer = self._object(self.call("POST", "/api/v2/play/token", sensitive=True),
+                              "a box token")
         if isinstance(answer.get("token"), str):
             self.add_secret(answer["token"])
         return answer
