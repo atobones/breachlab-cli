@@ -995,9 +995,23 @@ class RedactionTests(SdkCase):
         self.assertNotIn(TOKEN, text)
 
     def test_nothing_is_logged_or_printed_without_debug(self):
+        import contextlib
+        import io
+        import logging
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger = logging.getLogger("breachlab")
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        self.addCleanup(logger.removeHandler, handler)
+        self.addCleanup(logger.setLevel, logging.NOTSET)
+        out, err = io.StringIO(), io.StringIO()
         self.script.queue({"object": "account"})
-        with self.assertNoLogs("breachlab", level="DEBUG"):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.client.me()
+        self.assertEqual(records, [])
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
 
     def test_a_token_echoed_by_the_server_is_redacted_in_debug(self):
         lines = []
