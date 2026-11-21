@@ -9,6 +9,7 @@
 from breachlab._version import __version__
 from breachlab.client import BreachLab, new_idempotency_key
 from breachlab.errors import (
+    AdminNotAllowedError,
     AlreadySolvedError,
     ApiError,
     AuthenticationError,
@@ -47,6 +48,7 @@ __all__ = [
     "ForbiddenError",
     "PaywallError",
     "NotAnAgentError",
+    "AdminNotAllowedError",
     "NotFoundError",
     "ConflictError",
     "AlreadySolvedError",

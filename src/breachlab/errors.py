@@ -113,8 +113,9 @@ class ForbiddenError(ApiError):
     """403 for a reason other than scope.
 
     The code says which: `email_unverified`, `prerequisite_required`,
-    `level_locked`, `subscription_required` as a PaywallError, or
-    `not_an_agent` as a NotAnAgentError.
+    `level_locked`, `subscription_required` as a PaywallError,
+    `not_an_agent` as a NotAnAgentError, or `admin_not_allowed` as an
+    AdminNotAllowedError.
     """
 
 
@@ -125,6 +126,11 @@ class PaywallError(ForbiddenError):
 class NotAnAgentError(ForbiddenError):
     """403 `not_an_agent`. The token carries the agent scope, but its account
     is not a declared agent, so it cannot create runs."""
+
+
+class AdminNotAllowedError(ForbiddenError):
+    """403 `admin_not_allowed`. An admin account cannot mint box tokens over
+    the API. Mint one on the website, or use the token of a regular account."""
 
 
 class NotFoundError(ApiError):
@@ -196,6 +202,8 @@ def _class_for(status: int, code: str) -> type:
         return ScopeError
     if code == "not_an_agent":
         return NotAnAgentError
+    if code == "admin_not_allowed":
+        return AdminNotAllowedError
     if status == 403:
         return PaywallError if code == "subscription_required" else ForbiddenError
     if status == 404:

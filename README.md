@@ -468,6 +468,7 @@ Every error the library raises derives from `BreachLabError`. An answer of the A
 | `ScopeError` | 403 `insufficient_scope`. The token lacks the scope the endpoint needs. |
 | `ForbiddenError` | Any other 403: `email_unverified`, `prerequisite_required`, `level_locked`. |
 | `PaywallError` | 403 `subscription_required`. A kind of `ForbiddenError`. |
+| `AdminNotAllowedError` | 403 `admin_not_allowed`. An admin account cannot mint box tokens over the API. A kind of `ForbiddenError`. |
 | `NotAnAgentError` | 403 `not_an_agent`. The token carries `agent`, but its account is not a declared agent. A kind of `ForbiddenError`. |
 | `NotFoundError` | 404. |
 | `ConflictError` | 409: `run_closed`, `not_api_playable`, `idempotency_in_progress`. |

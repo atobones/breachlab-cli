@@ -37,6 +37,7 @@ from breachlab import (  # noqa: E402
     NotLoggedIn,
     Page,
     Paginator,
+    AdminNotAllowedError,
     NotAnAgentError,
     PaywallError,
     RateLimitError,
@@ -556,6 +557,7 @@ class ErrorTests(SdkCase):
         (403, "level_locked", ForbiddenError),
         (403, "email_unverified", ForbiddenError),
         (403, "not_an_agent", NotAnAgentError),
+        (403, "admin_not_allowed", AdminNotAllowedError),
         (404, "not_found", NotFoundError),
         (404, "board_unavailable", NotFoundError),
         (409, "already_solved", AlreadySolvedError),
@@ -602,6 +604,8 @@ class ErrorTests(SdkCase):
         self.assertTrue(issubclass(PaywallError, ForbiddenError))
         self.assertTrue(issubclass(NotAnAgentError, ForbiddenError))
         self.assertFalse(issubclass(NotAnAgentError, ScopeError))
+        self.assertTrue(issubclass(AdminNotAllowedError, ForbiddenError))
+        self.assertFalse(issubclass(AdminNotAllowedError, PaywallError))
         self.assertFalse(issubclass(ScopeError, ForbiddenError))
         self.assertTrue(issubclass(AlreadySolvedError, ConflictError))
 
