@@ -1,7 +1,7 @@
 """Show your progress, then submit a flag.
 
     python examples/progress_and_submit.py            progress only
-    python examples/progress_and_submit.py 'BL{...}'  progress, then submit
+    python examples/progress_and_submit.py "$FLAG"   progress, then submit
 
 The token comes from BREACHLAB_TOKEN, or from the file "breachlab login" saved.
 """
