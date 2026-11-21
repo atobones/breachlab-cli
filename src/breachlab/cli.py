@@ -7,19 +7,24 @@ import re
 import sys
 import time
 import traceback
-import urllib.parse
 
 from breachlab import __version__
 from breachlab import config
 from breachlab.client import (
-    ApiError,
-    Client,
-    ConfigError,
+    BreachLab,
+    CLI_USER_AGENT,
+    DEFAULT_SCOPE,
     DEFAULT_TIMEOUT,
+    endpoint_missing,
+    seconds,
+)
+from breachlab.errors import (
+    ApiError,
+    ConfigError,
+    DeviceFlowError,
     NetworkError,
     NotLoggedIn,
-    error_from,
-    seconds,
+    UnexpectedResponse,
 )
 from breachlab.output import Style, clean, pairs, table, use_color
 
@@ -36,6 +41,9 @@ ACCOUNT_PAGE = "https://breachlab.org/dashboard/account"
 FLAG_MIN = 4
 FLAG_MAX = 128
 COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
+# Which scopes exist is the server's business. The client only refuses names
+# that could not be a scope on any server.
+SCOPE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,32}$")
 DIFFICULTY_STYLE = {"easy": "green", "medium": "yellow", "hard": "red", "insane": "red"}
 STATUS_STYLE = {"solved": "green", "available": None, "locked": "dim"}
 
@@ -78,20 +86,27 @@ class Context:
     def _debug_line(self, text):
         print(self.err_style.paint("debug: " + text, "dim"), file=self.err)
 
-    def client(self, need_token=True):
-        base = os.environ.get(config.ENV_API) or config.DEFAULT_API
-        token = None
-        if need_token:
+    def client(self, need_token=True, token=None, quiet=False):
+        """The SDK client every command talks through.
+
+        The command decides where the token comes from and never lets the
+        client look for one, and it repeats nothing after a failure, so what
+        it prints stays the same from run to run.
+        """
+        if need_token and token is None:
             token, self.token_source = config.load_token()
             if not token:
                 raise NotLoggedIn()
-        return Client(
-            base,
+        return BreachLab(
             token=token,
+            base_url=os.environ.get(config.ENV_API) or config.DEFAULT_API,
             timeout=self.args.timeout,
+            user_agent=CLI_USER_AGENT,
             debug=self._debug_line if self.debug else None,
-            notify=self.note,
-            auto_wait=not self.args.no_wait,
+            notify=None if quiet else self.note,
+            wait_on_rate_limit=True if quiet else not self.args.no_wait,
+            retry_errors=False,
+            auto_token=False,
         )
 
 
@@ -100,19 +115,19 @@ class Context:
 
 def cmd_login(ctx):
     client = ctx.client(need_token=False)
-    scope = "read" if ctx.args.read_only else "read submit"
-    start = client.call("POST", "/api/v1/auth/device", body={"scope": scope}, auth=False)
+    scope = _requested_scope(ctx.args)
+    try:
+        start = client.start_device_login(scope)
+    except UnexpectedResponse as exc:
+        raise Failure(exc.detail, EXIT_REFUSED, code="bad_response")
+    except ApiError as exc:
+        if exc.code == "invalid_scope":
+            exc.detail = "The server refused the requested scope. %s." % exc.detail.rstrip(". ")
+        raise
 
-    device_code = start.get("device_code") if isinstance(start, dict) else None
-    user_code = start.get("user_code") if isinstance(start, dict) else None
-    if not isinstance(device_code, str) or not isinstance(user_code, str):
-        raise Failure("The server started the login in an unexpected way.", EXIT_REFUSED,
-                      code="bad_response")
-    client.add_secret(device_code)
+    device_code = start["device_code"]
+    user_code = start["user_code"]
     url = start.get("verification_uri_complete") or start.get("verification_uri")
-    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-        raise Failure("The server did not say where to approve the login.", EXIT_REFUSED,
-                      code="bad_response")
     expires_in = _positive_int(start.get("expires_in"), 600)
     interval = _positive_int(start.get("interval"), 5)
 
@@ -138,9 +153,8 @@ def cmd_login(ctx):
 
     username = None
     try:
-        me = Client(client.base_url, token=token, timeout=ctx.args.timeout,
-                    debug=ctx._debug_line if ctx.debug else None).call("GET", "/api/v2/me")
-        if isinstance(me, dict) and isinstance(me.get("username"), str):
+        me = ctx.client(token=token, quiet=True).me()
+        if isinstance(me.get("username"), str):
             username = me["username"]
     except (ApiError, NetworkError):
         pass
@@ -157,6 +171,8 @@ def cmd_login(ctx):
         who = " as " + style.paint(clean(username), "bold") if username else ""
         ctx.say()
         ctx.say("Logged in%s. Token saved to %s." % (who, config.display_path(path)))
+        if ctx.args.scope or set(granted_scope.split()) != set(scope.split()):
+            ctx.say("Granted scopes: %s." % (clean(", ".join(granted_scope.split())) or "none"))
         if "submit" not in granted_scope.split():
             ctx.say("This token can read but cannot submit flags.")
         ctx.say("Next: breachlab status")
@@ -165,74 +181,138 @@ def cmd_login(ctx):
     return EXIT_OK
 
 
+def _requested_scope(args):
+    """The scope string to ask for: space separated names, as the API expects."""
+    if args.read_only:
+        return "read"
+    if not args.scope:
+        return DEFAULT_SCOPE
+    names = []
+    for chunk in args.scope:
+        for name in re.split(r"[,\s]+", chunk):
+            if not name:
+                continue
+            if not SCOPE_RE.match(name):
+                raise Failure('"%s" is not a scope name. A scope name uses letters, digits, '
+                              'underscores, dots, colons and hyphens only.' % name, EXIT_USAGE)
+            if name not in names:
+                names.append(name)
+    if not names:
+        raise Failure("No scope given. Example: breachlab login --scope read,submit", EXIT_USAGE)
+    return " ".join(names)
+
+
 def _poll_for_token(client, device_code, interval, expires_in):
-    elapsed = 0
-    failures = 0
-    while True:
-        # One second over the interval, so network jitter cannot make a poll
-        # arrive early and earn a slow_down.
-        wait = interval + 1
-        if elapsed + wait > expires_in:
+    """Wait for the approval, wording every way it can end for the terminal."""
+    try:
+        return client.poll_device_login(device_code, interval, expires_in)
+    except DeviceFlowError as exc:
+        if exc.expired_locally:
             raise Failure('The code expired before it was approved. Run "breachlab login" again.',
                           EXIT_AUTH, code="expired_token")
-        sleep(wait)
-        elapsed += wait
-        try:
-            status, headers, payload = client.send(
-                "POST", "/api/v1/auth/token", body={"device_code": device_code}, auth=False)
-        except NetworkError:
-            failures += 1
-            if failures >= 3:
-                raise
-            continue
-        failures = 0
-        if status == 200 and isinstance(payload, dict) and "access_token" in payload:
-            return payload
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if error == "authorization_pending":
-            continue
-        if error == "slow_down":
-            interval += 5
-            continue
-        if error == "access_denied":
-            raise Failure("The request was denied in the browser. Nothing was saved.",
-                          EXIT_AUTH, code="access_denied")
-        if error == "expired_token":
+        if exc.code == "access_denied":
+            raise Failure("%s Nothing was saved."
+                          % (exc.description or "The request was denied in the browser."),
+                          EXIT_AUTH, code="access_denied", doc_url=exc.doc_url)
+        if exc.code == "expired_token":
             raise Failure('The code expired or was already used. Run "breachlab login" again.',
-                          EXIT_AUTH, code="expired_token")
-        failure = error_from(status, headers, payload)
-        if status == 429:
-            pause = failure.retry_after or interval
-            if elapsed + pause > expires_in:
-                raise failure
-            sleep(pause)
-            elapsed += pause
-            continue
-        raise failure
+                          EXIT_AUTH, code="expired_token", doc_url=exc.doc_url)
+        raise Failure("The server refused the login. %s"
+                      % (exc.description or "It gave no reason."),
+                      EXIT_REFUSED, code=exc.code, doc_url=exc.doc_url)
 
 
 def cmd_logout(ctx):
     path = config.token_path()
-    removed = config.delete_token()
+    shown = config.display_path(path)
     env_set = bool(os.environ.get(config.ENV_TOKEN, "").strip())
-    if ctx.json:
-        ctx.emit({"logged_out": removed, "token_path": path})
+    try:
+        token = config.load_saved_token()
+        damaged = False
+    except config.TokenError:
+        token, damaged = None, True
+
+    # Revoke on the server first, while the token is still at hand. Whatever
+    # the server says, the local file goes away afterwards.
+    outcome = _revoke(ctx, token) if token else None
+    removed = config.delete_token()
+
+    by_hand = "Revoke it by hand at %s" % ACCOUNT_PAGE
+    warning = None
+    if outcome == "revoked":
+        text = "Logged out. The token was revoked on the server and removed from %s." % shown
+    elif outcome == "already_invalid":
+        text = ("Logged out. The server had already revoked the token or let it expire. "
+                "It was removed from %s." % shown)
+    elif outcome is not None:
+        text = "Logged out. The token was removed from %s." % shown
+        if outcome == "unsupported":
+            reason = "This server cannot revoke tokens yet"
+        elif outcome == "unreachable":
+            reason = "The server could not be reached"
+        else:
+            reason = "The server did not revoke the token"
+        warning = "%s, so the token may still be valid. %s" % (reason, by_hand)
+    elif damaged and removed:
+        text = "Logged out. The damaged token file %s was removed." % shown
+        warning = ("Its token could not be read, so nothing was revoked. "
+                   "If that token may still be valid, revoke it by hand at %s" % ACCOUNT_PAGE)
     elif removed:
-        ctx.say("Logged out. The token was removed from %s." % config.display_path(path))
-        ctx.say("It stays valid on the server until you revoke it at %s" % ACCOUNT_PAGE)
+        text = "Logged out. The empty token file %s was removed." % shown
     else:
-        ctx.say("You were not logged in. There is no saved token.")
+        text = "You were not logged in. There is no saved token."
+
+    if ctx.json:
+        result = {"logged_out": removed, "revoked": outcome == "revoked", "token_path": path}
+        if outcome is not None:
+            result["revocation"] = outcome
+        if warning:
+            result["revoke_url"] = ACCOUNT_PAGE
+        ctx.emit(result)
+    else:
+        ctx.say(text)
+    if warning:
+        ctx.note(warning)
     if env_set:
-        ctx.note("Note: %s is still set, so commands will keep using that token."
-                 % config.ENV_TOKEN)
+        ctx.note("Note: %s is still set, so commands will keep using that token. "
+                 "Logout does not revoke it." % config.ENV_TOKEN)
     return EXIT_OK
+
+
+def _revoke(ctx, token):
+    """Ask the server to revoke the saved token. Return what came of it.
+
+    "revoked", "already_invalid" when the server no longer knows the token,
+    "unsupported" when the server has no such endpoint, "unreachable", or
+    "failed" for anything else. It never raises, so logout always finishes.
+    """
+    try:
+        client = ctx.client(token=token)
+        # Logging out should not sit through a rate limit, so no waiting.
+        answer = client.revoke_token(wait=False)
+    except ApiError as exc:
+        if exc.status == 401:
+            return "already_invalid"
+        if endpoint_missing(exc):
+            return "unsupported"
+        return "failed"
+    except NetworkError:
+        return "unreachable"
+    except ConfigError:
+        return "failed"
+    if answer.get("revoked") is True:
+        return "revoked"
+    return "failed"
 
 
 def cmd_whoami(ctx):
     client = ctx.client()
-    me = client.call("GET", "/api/v2/me")
+    me = client.me()
+    token = _token_details(client)
     if ctx.json:
-        ctx.emit(me)
+        # The account object, plus the token object under "token". That key is
+        # null on a server that cannot describe the token yet.
+        ctx.emit(dict(me, token=token))
         return EXIT_OK
     access = me.get("access") if isinstance(me.get("access"), dict) else {}
     if access.get("subscription_active"):
@@ -247,19 +327,58 @@ def cmd_whoami(ctx):
         ("Solved", str(me.get("solved", 0))),
         ("Subscription", subscription),
     ]
+    rank = _rank_text(me)
+    if rank:
+        rows.append(("Rank", rank))
     if me.get("is_agent"):
         rows.append(("Account type", "AI agent"))
     if ctx.token_source == "env":
         rows.append(("Token", "from %s" % config.ENV_TOKEN))
     else:
         rows.append(("Token", config.display_path(config.token_path())))
+    scopes = None
+    if token is not None:
+        scopes = [s for s in token.get("scopes") or [] if isinstance(s, str)] \
+            if isinstance(token.get("scopes"), list) else []
+        rows.append(("Scopes", clean(", ".join(scopes)) or "none"))
+        expires = token.get("expires_at")
+        rows.append(("Expires", "%s UTC" % _when(expires) if isinstance(expires, str) and expires
+                     else "never"))
     ctx.say(pairs(rows, ctx.style))
+    if scopes is not None and "submit" not in scopes:
+        ctx.say()
+        ctx.say('This token cannot submit flags. Run "breachlab login" to get one that can.')
     return EXIT_OK
+
+
+def _token_details(client):
+    """The calling token as the API describes it, or None on an older server."""
+    try:
+        return client.token_info()
+    except UnexpectedResponse:
+        return None
+    except ApiError as exc:
+        if endpoint_missing(exc):
+            return None
+        raise
+
+
+def _rank_text(me):
+    """The account's leaderboard place, or None when it is not ranked or unknown."""
+    place = me.get("leaderboard")
+    if not isinstance(place, dict):
+        return None
+    rank = _count(place.get("rank"))
+    if not rank:
+        return None
+    if place.get("board") in ("humans", "agents"):
+        return "%d on the %s board" % (rank, place["board"])
+    return str(rank)
 
 
 def cmd_tracks(ctx):
     client = ctx.client()
-    tracks, more = client.fetch_list("/api/v2/tracks")
+    tracks, more = _all(client.tracks())
     if ctx.json:
         ctx.emit({"object": "list", "data": tracks, "has_more": more})
         return EXIT_OK
@@ -289,27 +408,16 @@ def cmd_tracks(ctx):
 def cmd_levels(ctx):
     client = ctx.client()
     slug = ctx.args.track.strip().lower()
-    try:
-        levels, more = client.fetch_list("/api/v2/tracks/%s/levels" % _path_part(slug))
-    except ApiError as exc:
-        if exc.code == "not_found":
-            exc.detail = 'There is no live track named "%s". Run "breachlab tracks" to list them.' \
-                % clean(slug)
-        raise
 
     if ctx.args.level is not None:
-        match = [lv for lv in levels if lv.get("idx") == ctx.args.level]
-        if not match:
-            raise Failure('Track "%s" has no level %d. Run "breachlab levels %s" to list them.'
-                          % (clean(slug), ctx.args.level, clean(slug)), EXIT_REFUSED,
-                          code="not_found")
-        level = match[0]
+        level = _one_level(client, slug, ctx.args.level)
         if ctx.json:
             ctx.emit(level)
             return EXIT_OK
         _print_level(ctx, level)
         return EXIT_OK
 
+    levels, more = _levels_of(client, slug)
     if ctx.json:
         ctx.emit({"object": "list", "data": levels, "has_more": more})
         return EXIT_OK
@@ -332,6 +440,37 @@ def cmd_levels(ctx):
     ctx.say(table(["LEVEL", "TITLE", "DIFFICULTY", "POINTS", "STATUS", "ACCESS"], rows, ctx.style,
                   right=(0, 3)))
     return EXIT_OK
+
+
+def _levels_of(client, slug):
+    try:
+        return _all(client.levels(slug))
+    except ApiError as exc:
+        if exc.code == "not_found":
+            exc.detail = 'There is no live track named "%s". Run "breachlab tracks" to list them.' \
+                % clean(slug)
+        raise
+
+
+def _one_level(client, slug, idx):
+    """One level from its own endpoint, or from the level list on an older server.
+
+    A 404 also falls through to the list. That costs one more request for a
+    level that does not exist, and in return the error can say whether the
+    track or the level is the unknown one.
+    """
+    try:
+        return client.level(slug, idx)
+    except ApiError as exc:
+        if not endpoint_missing(exc):
+            raise
+
+    levels, _ = _levels_of(client, slug)
+    for level in levels:
+        if isinstance(level, dict) and level.get("idx") == idx:
+            return level
+    raise Failure('Track "%s" has no level %d. Run "breachlab levels %s" to list them.'
+                  % (clean(slug), idx, clean(slug)), EXIT_REFUSED, code="not_found")
 
 
 def _print_level(ctx, level):
@@ -357,67 +496,88 @@ def _print_level(ctx, level):
 
 def cmd_status(ctx):
     client = ctx.client()
-    me = client.call("GET", "/api/v2/me")
-    tracks, _ = client.fetch_list("/api/v2/tracks")
-    report = []
-    for track in tracks:
-        slug = track.get("slug")
-        if not isinstance(slug, str):
-            continue
-        levels, _ = client.fetch_list("/api/v2/tracks/%s/levels" % _path_part(slug))
-        solved = [lv for lv in levels if lv.get("status") == "solved"]
-        open_levels = sorted((lv for lv in levels if lv.get("status") == "available"),
-                             key=lambda lv: lv.get("idx", 0))
-        report.append({
-            "slug": slug,
-            "name": track.get("name"),
-            "access": track.get("access"),
-            "levels": len(levels),
-            "solved": len(solved),
-            "points": sum(lv.get("points", 0) for lv in solved
-                          if isinstance(lv.get("points"), int)),
-            "completed": bool(levels) and len(solved) == len(levels),
-            "next_level": open_levels[0] if open_levels else None,
-        })
+    me = client.me()
+    report = _progress(client)
 
     if ctx.json:
         ctx.emit({"object": "status", "account": me, "tracks": report})
         return EXIT_OK
 
-    ctx.say("%s  %s points  %s solved" % (ctx.style.paint(clean(me.get("username")), "bold"),
-                                          me.get("points", 0), me.get("solved", 0)))
+    headline = "%s  %s points  %s solved" % (ctx.style.paint(clean(me.get("username")), "bold"),
+                                             me.get("points", 0), me.get("solved", 0))
+    rank = _rank_text(me)
+    if rank:
+        headline += "  rank " + rank
+    ctx.say(headline)
     if not report:
         ctx.say("No tracks are live yet.")
         return EXIT_OK
     ctx.say()
     rows = []
     for item in report:
-        nxt = item["next_level"]
-        if item["levels"] == 0:
+        total = _count(item.get("level_count"))
+        solved = _count(item.get("solved"))
+        nxt = item.get("next_level_idx")
+        if not isinstance(nxt, int) or isinstance(nxt, bool):
+            nxt = None
+        locked = item.get("access") == "locked"
+        if total == 0:
             upcoming = ("no levels yet", "dim")
-        elif item["completed"]:
+        elif solved >= total:
             upcoming = ("complete", "green")
-        elif nxt is None and item["access"] == "locked":
+        elif nxt is None and locked:
             upcoming = ("not open to your account", "dim")
         elif nxt is None:
             upcoming = ("locked", "dim")
+        elif locked:
+            upcoming = ("%d, not open to your account" % nxt, "dim")
         else:
-            text = "%s %s" % (nxt.get("idx"), clean(nxt.get("title")))
-            if nxt.get("access") == "locked":
-                upcoming = (text + ", not open to your account", "dim")
-            else:
-                upcoming = text
-        access = clean(item["access"])
+            upcoming = str(nxt)
+        access = clean(item.get("access"))
         rows.append([
-            clean(item["slug"]),
-            "%d/%d" % (item["solved"], item["levels"]),
-            str(item["points"]),
-            (access, "dim" if access == "locked" else None),
+            clean(item.get("track")),
+            clean(item.get("name")),
+            "%d/%d" % (solved, total),
+            (access, "dim" if locked else None),
             upcoming,
         ])
-    ctx.say(table(["TRACK", "SOLVED", "POINTS", "ACCESS", "NEXT LEVEL"], rows, ctx.style,
-                  right=(1, 2)))
+    ctx.say(table(["TRACK", "NAME", "SOLVED", "ACCESS", "NEXT LEVEL"], rows, ctx.style, right=(2,)))
     return EXIT_OK
+
+
+def _progress(client):
+    """One track_progress object per live track.
+
+    A current server answers this in one call. An older one is asked for its
+    tracks and then for the levels of each, and the same objects are built
+    here, so the output does not depend on the server's age.
+    """
+    try:
+        entries = client.progress().all()
+    except ApiError as exc:
+        if not endpoint_missing(exc):
+            raise
+    else:
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    report = []
+    for track in client.tracks():
+        slug = track.get("slug") if isinstance(track, dict) else None
+        if not isinstance(slug, str):
+            continue
+        levels = [lv for lv in client.levels(slug) if isinstance(lv, dict)]
+        open_idx = [lv["idx"] for lv in levels if lv.get("status") == "available"
+                    and isinstance(lv.get("idx"), int) and not isinstance(lv.get("idx"), bool)]
+        report.append({
+            "object": "track_progress",
+            "track": slug,
+            "name": track.get("name"),
+            "access": track.get("access"),
+            "level_count": len(levels),
+            "solved": sum(1 for lv in levels if lv.get("status") == "solved"),
+            "next_level_idx": min(open_idx) if open_idx else None,
+        })
+    return report
 
 
 def cmd_submit(ctx):
@@ -425,11 +585,11 @@ def cmd_submit(ctx):
     client = ctx.client()
     # A wrong flag earns a growing cooldown, so a submission is never retried
     # behind the user's back unless they asked for it with --wait.
-    result = client.call("POST", "/api/v2/submit", body={"flag": flag}, wait=ctx.args.wait)
-    verdict = result.get("result") if isinstance(result, dict) else None
-    if verdict not in ("correct", "incorrect"):
-        raise Failure("The server sent a verdict in an unexpected shape.", EXIT_REFUSED,
-                      code="bad_response")
+    try:
+        result = client.submit(flag, wait=ctx.args.wait)
+    except UnexpectedResponse as exc:
+        raise Failure(exc.detail, EXIT_REFUSED, code="bad_response")
+    verdict = result["result"]
     if ctx.json:
         ctx.emit(result)
         return EXIT_OK if verdict == "correct" else EXIT_REFUSED
@@ -482,15 +642,8 @@ def _read_flag(ctx):
 
 def cmd_leaderboard(ctx):
     args = ctx.args
-    query = {}
-    if args.board != "humans":
-        query["board"] = args.board
-    if args.period != "all":
-        query["period"] = args.period
-    if args.country:
-        if not COUNTRY_RE.match(args.country):
-            raise Failure("A country is a two letter code such as us or de.", EXIT_USAGE)
-        query["country"] = args.country.lower()
+    if args.country and not COUNTRY_RE.match(args.country):
+        raise Failure("A country is a two letter code such as us or de.", EXIT_USAGE)
     if args.board == "agents" and (args.period != "all" or args.country):
         raise Failure("The agents board supports only the all time period and no country filter.",
                       EXIT_USAGE)
@@ -498,8 +651,9 @@ def cmd_leaderboard(ctx):
         raise Failure("A country filter works only with the all time period.", EXIT_USAGE)
 
     client = ctx.client()
-    entries, more = client.fetch_list("/api/v2/leaderboard", query=query,
-                                      max_items=None if args.all else args.limit)
+    entries, more = _all(client.leaderboard(
+        board=args.board, period=args.period, country=args.country,
+        max_items=None if args.all else args.limit))
     if ctx.json:
         ctx.emit({"object": "list", "data": entries, "has_more": more})
         return EXIT_OK
@@ -539,8 +693,7 @@ def cmd_leaderboard(ctx):
 
 def cmd_solves(ctx):
     client = ctx.client()
-    solves, more = client.fetch_list("/api/v2/me/solves",
-                                     max_items=None if ctx.args.all else ctx.args.limit)
+    solves, more = _all(client.solves(max_items=None if ctx.args.all else ctx.args.limit))
     if ctx.json:
         ctx.emit({"object": "list", "data": solves, "has_more": more})
         return EXIT_OK
@@ -566,8 +719,17 @@ def cmd_solves(ctx):
 # -- helpers -------------------------------------------------------------------
 
 
-def _path_part(value):
-    return urllib.parse.quote(value, safe="")
+def _all(paginator):
+    """Every item of a list, and whether the API had more past the last one."""
+    items = paginator.all()
+    return items, bool(paginator.has_more)
+
+
+def _count(value):
+    """A count from the API as a whole number that is never negative."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 0
 
 
 def _positive_int(value, default):
@@ -678,11 +840,15 @@ def build_parser():
         return child
 
     login = command("login", cmd_login, "log in by approving a code in your browser")
-    login.add_argument("--read-only", action="store_true",
-                       help="ask for a token that can read but cannot submit flags")
+    scopes = login.add_mutually_exclusive_group()
+    scopes.add_argument("--read-only", action="store_true",
+                        help="ask for a token that can read but cannot submit flags")
+    scopes.add_argument("--scope", nargs="+", metavar="SCOPE",
+                        help="ask for exactly these scopes, separated by commas or spaces, "
+                             "for example read,submit,play. The default is read,submit")
 
-    command("logout", cmd_logout, "remove the saved token from this machine")
-    command("whoami", cmd_whoami, "show the account the token belongs to")
+    command("logout", cmd_logout, "revoke the saved token and remove it from this machine")
+    command("whoami", cmd_whoami, "show the account and what the token may do")
     command("tracks", cmd_tracks, "list the live tracks")
 
     levels = command("levels", cmd_levels, "list the levels of a track, or show one briefing")
@@ -762,7 +928,7 @@ def _report_api_error(ctx, exc):
     elif exc.status == 429:
         exit_code = EXIT_RATE_LIMITED
         if exc.code == "cooldown":
-            message = "Slow down after wrong answers."
+            message = "You are submitting too fast."
         else:
             message = "Rate limited."
         if exc.retry_after is not None:

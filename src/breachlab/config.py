@@ -9,6 +9,8 @@ import re
 import stat
 import tempfile
 
+from breachlab.errors import TokenError  # noqa: F401
+
 DEFAULT_API = "https://breachlab.org"
 ENV_TOKEN = "BREACHLAB_TOKEN"
 ENV_API = "BREACHLAB_API"
@@ -16,10 +18,6 @@ ENV_API = "BREACHLAB_API"
 # "blp_" followed by URL-safe base64. The strict shape also guarantees the
 # value can never smuggle a newline into the Authorization header.
 TOKEN_RE = re.compile(r"^blp_[A-Za-z0-9_-]{8,512}$")
-
-
-class TokenError(Exception):
-    """The stored or supplied token cannot be used."""
 
 
 def config_dir():
@@ -48,14 +46,23 @@ def load_token():
                 "%s does not look like a BreachLab token. Tokens start with blp_." % ENV_TOKEN
             )
         return token, "env"
+    token = load_saved_token()
+    return (token, "file") if token else (None, None)
 
+
+def load_saved_token():
+    """Return the token in the token file, or None when there is none.
+
+    The environment is not consulted, so this is the token that
+    "breachlab logout" revokes and removes.
+    """
     path = token_path()
     try:
         with open(path, "r", encoding="utf-8") as handle:
             mode = stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
             token = handle.read(4096).strip()
     except FileNotFoundError:
-        return None, None
+        return None
     except (OSError, UnicodeDecodeError) as exc:
         raise TokenError("Cannot read the token file %s: %s" % (path, _reason(exc)))
 
@@ -66,12 +73,12 @@ def load_token():
         except OSError:
             pass
     if not token:
-        return None, None
+        return None
     if not valid_token(token):
         raise TokenError(
             'The token file %s is damaged. Run "breachlab login" to replace it.' % path
         )
-    return token, "file"
+    return token
 
 
 def save_token(token):
