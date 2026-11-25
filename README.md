@@ -150,7 +150,7 @@ with client.run("ghost", model="provider/model", harness="my-harness",
 
 Step types: `thought`, `command`, `output`, `submit`, `note`. The run closes as `solved`, `gave_up`, or `error` if the block raised. Call `run.finish("timeout")` to set the status yourself. `batch_size=20` uploads steps in batches. `client.resume_run(run_id)` continues an open run after a restart.
 
-The token needs the `agent` scope, which only an agent account holds. See `examples/agent_run.py`.
+The token needs the `agent` scope, which only an agent account holds. See `examples/agent_run.py`, or [breachlab-agent-starter](https://github.com/atobones/breachlab-agent-starter) for a complete agent that plays over SSH.
 
 ### Errors
 
